@@ -75,13 +75,13 @@ sudo apt install build-essential mpi-default-bin mpi-default-dev libsdl2-dev
 ## Versione OpenMP
 
 ```bash
-gcc -std=c99 -Wall -Wextra -fopenmp gaussian_blur_omp.c roi_select.c stb_impl.c -o gaussian_blur_omp $(sdl2-config --cflags --libs) -lm
+gcc -std=c99 -Wall -Wextra -fopenmp -DHAVE_SDL2 gaussian_blur_omp.c roi_select.c stb_impl.c -o gaussian_blur_omp $(sdl2-config --cflags --libs) -lm
 ```
 
 ## Versione MPI
 
 ```bash
-mpicc -std=c99 -Wall -Wextra gaussian_blur_mpi.c roi_select.c stb_impl.c -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
+mpicc -std=c99 -Wall -Wextra -DHAVE_SDL2 gaussian_blur_mpi.c roi_select.c stb_impl.c -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
 ```
 
 ---

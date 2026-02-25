@@ -540,7 +540,7 @@ int main(int argc, char** argv) {
 
     double my_comp = tC1 - tC0;
 
-    /* MPI_Reduce: rank 0 prende il massimo dei tempi (tempo reale della fase parallela) */
+    /* MPI_Reduce: rank 0 prende il massimo dei tempi */
     double comp_max = 0.0;
     MPI_Reduce(&my_comp, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
