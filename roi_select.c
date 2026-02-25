@@ -62,10 +62,11 @@ static unsigned char* ppm_read_rgb8(const char *path, int *W, int *H) {
 
     if (strcasecmp(fmt, "P6") == 0) {
         /* P6 binario */
-        if (fread(rgb, 3, n, f) != n) 
-        { 
-        free(rgb); 
-        fclose(f); return 0; }
+        if (fread(rgb, 3, n, f) != n) {
+            free(rgb);
+            fclose(f);
+            return 0;
+        }
 
         if (maxv != 255) {
             for (size_t i = 0; i < 3*n; i++) {
@@ -85,12 +86,9 @@ static unsigned char* ppm_read_rgb8(const char *path, int *W, int *H) {
                 g = g * 255 / maxv;
                 b = b * 255 / maxv;
             }
-            if (r < 0) r = 0; 
-            if (r > 255) r = 255;
-            if (g < 0) g = 0; 
-            if (g > 255) g = 255;
-            if (b < 0) b = 0; 
-            if (b > 255) b = 255;
+            r = clampi(r, 0, 255);
+            g = clampi(g, 0, 255);
+            b = clampi(b, 0, 255);
 
             rgb[3*i + 0] = (unsigned char)r;
             rgb[3*i + 1] = (unsigned char)g;
@@ -118,6 +116,80 @@ static unsigned char* rgb_to_rgba(const unsigned char *rgb, int W, int H) {
         rgba[4*i + 3] = 255;
     }
     return rgba;
+}
+
+/* Calcola dst rect: immagine scalata per entrare nella finestra, centrata */
+static SDL_Rect compute_dst_rect(SDL_Window *win, int img_w, int img_h) {
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(win, &ww, &wh);
+
+    float sx = (float)ww / (float)img_w;
+    float sy = (float)wh / (float)img_h;
+    float s  = (sx < sy) ? sx : sy;
+    if (s <= 0.f) s = 1.f;
+
+    int draw_w = (int)(img_w * s);
+    int draw_h = (int)(img_h * s);
+    if (draw_w < 1) draw_w = 1;
+    if (draw_h < 1) draw_h = 1;
+
+    SDL_Rect dst;
+    dst.w = draw_w;
+    dst.h = draw_h;
+    dst.x = (ww - draw_w) / 2;
+    dst.y = (wh - draw_h) / 2;
+    return dst;
+}
+
+/* Mappa mouse finestra -> coordinate immagine (tenendo conto di dst rect) */
+static void map_mouse_to_image(int mx, int my, SDL_Rect dst,
+                               int img_w, int img_h, int *ix, int *iy)
+{
+    /* clamp mouse dentro il rettangolo disegnato */
+    if (mx < dst.x) mx = dst.x;
+    if (mx > dst.x + dst.w - 1) mx = dst.x + dst.w - 1;
+    if (my < dst.y) my = dst.y;
+    if (my > dst.y + dst.h - 1) my = dst.y + dst.h - 1;
+
+    float fx = (float)(mx - dst.x) / (float)dst.w;
+    float fy = (float)(my - dst.y) / (float)dst.h;
+
+    int x = (int)(fx * img_w);
+    int y = (int)(fy * img_h);
+
+    x = clampi(x, 0, img_w - 1);
+    y = clampi(y, 0, img_h - 1);
+
+    *ix = x;
+    *iy = y;
+}
+
+/* Mappa coordinate immagine -> coordinate finestra (per disegnare rettangolo ROI) */
+static SDL_Rect map_roi_to_window(int x0, int y0, int x1, int y1,
+                                  SDL_Rect dst, int img_w, int img_h)
+{
+    int left   = (x0 < x1) ? x0 : x1;
+    int right  = (x0 > x1) ? x0 : x1;
+    int top    = (y0 < y1) ? y0 : y1;
+    int bottom = (y0 > y1) ? y0 : y1;
+
+    float sx = (float)dst.w / (float)img_w;
+    float sy = (float)dst.h / (float)img_h;
+
+    int wx0 = dst.x + (int)(left * sx);
+    int wy0 = dst.y + (int)(top  * sy);
+    int wx1 = dst.x + (int)((right + 1) * sx) - 1;
+    int wy1 = dst.y + (int)((bottom + 1) * sy) - 1;
+
+    SDL_Rect r;
+    r.x = wx0;
+    r.y = wy0;
+    r.w = (wx1 - wx0 + 1);
+    r.h = (wy1 - wy0 + 1);
+
+    if (r.w < 1) r.w = 1;
+    if (r.h < 1) r.h = 1;
+    return r;
 }
 
 /* -------------------- public API -------------------- */
@@ -163,11 +235,28 @@ int roi_select_interactive(const char *image_path,
         return 0;
     }
 
+    /* --- automatic window size: 90%% of display, but not larger than image --- */
+    SDL_DisplayMode dm;
+    if (SDL_GetCurrentDisplayMode(0, &dm) != 0) {
+        fprintf(stderr, "SDL_GetCurrentDisplayMode failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        if (from_stb) stbi_image_free(pixels_rgba); else free(pixels_rgba);
+        return 0;
+    }
+
+    int win_w = (int)(dm.w * 0.90);
+    int win_h = (int)(dm.h * 0.90);
+    if (win_w < 640) win_w = 640;
+    if (win_h < 480) win_h = 480;
+
+    if (img_w < win_w) win_w = img_w;
+    if (img_h < win_h) win_h = img_h;
+
     SDL_Window *win = SDL_CreateWindow(
         "ROI Select - drag mouse | ENTER=OK | ESC=Cancel",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        img_w, img_h,
-        SDL_WINDOW_SHOWN
+        win_w, win_h,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -208,6 +297,9 @@ int roi_select_interactive(const char *image_path,
 
     int running = 1;
     while (running) {
+        /* dst rect aggiornato in base alla dimensione corrente della finestra */
+        SDL_Rect dst = compute_dst_rect(win, img_w, img_h);
+
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
@@ -222,12 +314,16 @@ int roi_select_interactive(const char *image_path,
                 }
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                 selecting = 1;
-                x0 = x1 = clampi(e.button.x, 0, img_w - 1);
-                y0 = y1 = clampi(e.button.y, 0, img_h - 1);
+                int ix, iy;
+                map_mouse_to_image(e.button.x, e.button.y, dst, img_w, img_h, &ix, &iy);
+                x0 = x1 = ix;
+                y0 = y1 = iy;
                 have_roi = 0;
             } else if (e.type == SDL_MOUSEMOTION && selecting) {
-                x1 = clampi(e.motion.x, 0, img_w - 1);
-                y1 = clampi(e.motion.y, 0, img_h - 1);
+                int ix, iy;
+                map_mouse_to_image(e.motion.x, e.motion.y, dst, img_w, img_h, &ix, &iy);
+                x1 = ix;
+                y1 = iy;
             } else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
                 selecting = 0;
 
@@ -253,20 +349,13 @@ int roi_select_interactive(const char *image_path,
         }
 
         SDL_RenderClear(ren);
-        SDL_RenderCopy(ren, tex, 0, 0);
 
+        /* disegno immagine scalata e centrata */
+        SDL_RenderCopy(ren, tex, NULL, &dst);
+
+        /* disegno rettangolo ROI (convertito in coordinate finestra) */
         if (selecting || have_roi) {
-            int left   = (x0 < x1) ? x0 : x1;
-            int right  = (x0 > x1) ? x0 : x1;
-            int top    = (y0 < y1) ? y0 : y1;
-            int bottom = (y0 > y1) ? y0 : y1;
-
-            SDL_Rect r;
-            r.x = left;
-            r.y = top;
-            r.w = right - left + 1;
-            r.h = bottom - top + 1;
-
+            SDL_Rect r = map_roi_to_window(x0, y0, x1, y1, dst, img_w, img_h);
             SDL_SetRenderDrawColor(ren, 255, 0, 0, 255);
             SDL_RenderDrawRect(ren, &r);
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);

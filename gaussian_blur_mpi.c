@@ -23,7 +23,7 @@
  *   sudo apt install build-essential mpi-default-bin mpi-default-dev libsdl2-dev
  *
  * Compilazione:
- *   mpicc -std=c99 -Wall -Wextra gaussian_blur_mpi.c roi_select.c stb_impl.c  -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
+ *   mpicc -std=c99 -Wall -Wextra -DHAVE_SDL2 gaussian_blur_mpi.c roi_select.c stb_impl.c -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
  *
  * Esecuzione:
  *   # ROI da riga di comando
@@ -48,7 +48,16 @@
 #include <unistd.h>
 #include <limits.h>
 
-#include "roi_select.h"
+#ifdef HAVE_SDL2
+  #include "roi_select.h"
+#else
+  /* fallback: compilazione senza SDL2 -> --select disabilitato */
+  static int roi_select_interactive(const char* path, int* x, int* y, int* w, int* h) {
+      (void)path; (void)x; (void)y; (void)w; (void)h;
+      fprintf(stderr, "Errore: programma compilato senza SDL2, usa --region.\n");
+      return 0;
+  }
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -205,26 +214,28 @@ float* make_gauss1d(void) {
 /* ========================== MAIN =================================== */
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv);  /* avvia ambiente MPI */
 
+    /* Identità del processo e numero totale di processi */
     int rank = 0, nprocs = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
-    
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);    /* rank = id del processo */
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);  /* nprocs = numero processi totali */
+
     //fprintf(stderr, "DEBUG: pid=%d rank=%d nprocs=%d\n", (int)getpid(), rank, nprocs);
     //fflush(stderr);
 
-   /* ---- PARSING ARGOMENTI: --region oppure --select ---- */
+    /* Buffer path: servono perché i processi MPI non condividono argv/memoria */
     char inBuf[PATH_MAX]  = {0};
     char outBuf[PATH_MAX] = {0};
 
     const char* inpath  = inBuf;
     const char* outpath = outBuf;
 
+    /* ROI globale (verrà condivisa a tutti) */
     int x0 = 0, y0 = 0, rw = 0, rh = 0;
 
     if (rank == 0) {
-
+        /* Solo rank 0 fa parsing argomenti e seleziona ROI (eventuale SDL) */
         if (argc == 4 && strcmp(argv[1], "--select") == 0) {
             // --select input output
             snprintf(inBuf,  sizeof(inBuf),  "%s", argv[2]);
@@ -256,7 +267,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* broadcast path e ROI a tutti */
+    /* MPI_Bcast: il rank 0 distribuisce a tutti path e ROI (stesse info per tutti) */
     MPI_Bcast(inBuf,  (int)sizeof(inBuf),  MPI_CHAR, 0, MPI_COMM_WORLD);
     MPI_Bcast(outBuf, (int)sizeof(outBuf), MPI_CHAR, 0, MPI_COMM_WORLD);
 
@@ -265,9 +276,9 @@ int main(int argc, char** argv) {
     MPI_Bcast(&rw, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&rh, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    /* se errore/annullato, esci tutti */
+    /* se errore/annullato, escono tutti (stessa condizione su ogni rank) */
     if (rw <= 0 || rh <= 0) {
-        MPI_Finalize();
+        MPI_Finalize();  /* chiusura MPI pulita */
         return 1;
     }
 
@@ -277,14 +288,14 @@ int main(int argc, char** argv) {
     double tR0 = 0.0, tR1 = 0.0;
 
     if (rank == 0) {
-        /* lettura immagine solo su rank 0 */
+        /* Solo rank 0 legge l’immagine dal disco */
         tR0 = MPI_Wtime();
         img = image_read_any(inpath, &W, &H);
         tR1 = MPI_Wtime();
 
         if (!img) {
             fprintf(stderr, "Errore lettura immagine\n");
-            MPI_Abort(MPI_COMM_WORLD, 2);
+            MPI_Abort(MPI_COMM_WORLD, 2); /* termina TUTTI i processi in errore */
         }
 
         /* clamp ROI dentro l'immagine */
@@ -302,7 +313,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* broadcast metadati immagine e ROI */
+    /* MPI_Bcast: condivido a tutti i metadati (W,H) e la ROI “corretta” clamped */
     MPI_Bcast(&W,  1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&H,  1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&x0, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -310,12 +321,12 @@ int main(int argc, char** argv) {
     MPI_Bcast(&rw, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&rh, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    /* tipo MPI per un Pixel */
+    /* MPI Datatype: definisco un tipo che rappresenta un Pixel (3 byte) */
     MPI_Datatype MPI_PIXEL;
     MPI_Type_contiguous((int)sizeof(Pixel), MPI_BYTE, &MPI_PIXEL);
     MPI_Type_commit(&MPI_PIXEL);
 
-    /* kernel gaussiano condiviso */
+    /* kernel gaussiano (uguale su tutti) */
     float* k = make_gauss1d();
     if (!k) {
         if (rank == 0) free(img);
@@ -324,7 +335,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* decomposizione 1D in X della ROI: ogni processo ha un blocco di colonne */
+    /* decomposizione 1D in X della ROI: ogni processo riceve un blocco di colonne */
     int base_w = rw / nprocs;
     int rem_w  = rw % nprocs;
 
@@ -339,10 +350,10 @@ int main(int argc, char** argv) {
 
     int my_h = rh;
 
-    Pixel* local_in  = 0;  /* (my_h x my_w) */
-    Pixel* local_out = 0;  /* (my_h x my_w) */
+    Pixel* local_in  = 0;  /* sotto-ROI locale in input */
+    Pixel* local_out = 0;  /* sotto-ROI locale in output */
 
-    /* distribuzione ROI dal rank 0 ai processi (scatter manuale) */
+    /* Scatter manuale: rank 0 invia ad ogni rank il suo blocco di ROI */
     if (rank == 0) {
         for (int r = 0; r < nprocs; ++r) {
             int lw = base_w + (r < rem_w ? 1 : 0);
@@ -356,32 +367,36 @@ int main(int argc, char** argv) {
             }
 
             if (r == 0) {
+                /* rank 0: copia direttamente la sua parte in local_in */
                 local_in = (Pixel*)malloc((size_t)my_h * (size_t)my_w * sizeof(Pixel));
+                if (!local_in) MPI_Abort(MPI_COMM_WORLD, 5);
+
                 for (int yy = 0; yy < my_h; ++yy) {
                     memcpy(local_in + (size_t)yy * (size_t)my_w,
                            img + (size_t)(y0 + yy) * (size_t)W + (size_t)(x0 + offx),
                            (size_t)my_w * sizeof(Pixel));
                 }
             } else {
+                /* altri rank: preparo un buffer tmp e lo invio con MPI_Send */
                 Pixel* tmp = (Pixel*)malloc((size_t)my_h * (size_t)lw * sizeof(Pixel));
+                if (!tmp) MPI_Abort(MPI_COMM_WORLD, 5);
+
                 for (int yy = 0; yy < my_h; ++yy) {
                     memcpy(tmp + (size_t)yy * (size_t)lw,
                            img + (size_t)(y0 + yy) * (size_t)W + (size_t)(x0 + offx),
                            (size_t)lw * sizeof(Pixel));
                 }
-                MPI_Send(
-                  tmp,
-                  my_h * lw,
-                  MPI_PIXEL,
-                  r,
-                  10,
-                  MPI_COMM_WORLD);
+
+                MPI_Send(tmp, my_h * lw, MPI_PIXEL, r, 10, MPI_COMM_WORLD); /* invio blocco ROI */
                 free(tmp);
             }
         }
     } else {
         if (my_w > 0) {
+            /* ogni rank != 0 riceve il proprio blocco ROI dal rank 0 */
             local_in = (Pixel*)malloc((size_t)my_h * (size_t)my_w * sizeof(Pixel));
+            if (!local_in) MPI_Abort(MPI_COMM_WORLD, 5);
+
             MPI_Recv(local_in, my_h * my_w, MPI_PIXEL, 0, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
     }
@@ -391,51 +406,58 @@ int main(int argc, char** argv) {
         if (!local_out) MPI_Abort(MPI_COMM_WORLD, 6);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);         /* sincronizzazione: inizio compute */
     double tC0 = MPI_Wtime();
 
     if (my_w > 0) {
-        /* halo orizzontale con MPI_Type_vector (colonne sinistra/destra) */
-        int halo = (R < my_w ? R : my_w);  // min(R, my_w)
-        int use_halo = (halo > 0);
 
-        Pixel* left_buf  = NULL;
-        Pixel* right_buf = NULL;
-        MPI_Datatype strip_type;
+        /* Halo exchange: scambio colonne di bordo con i vicini per la passata orizzontale */
+        const int halo = (R < my_w ? R : my_w);   /* halo effettivo = min(R, my_w) */
+        const int has_left  = (rank > 0);
+        const int has_right = (rank < nprocs - 1);
+        const int use_halo  = (halo > 0) && (has_left || has_right);
+
+        Pixel* left_buf  = NULL;   /* colonne ricevute dal vicino sinistro */
+        Pixel* right_buf = NULL;   /* colonne ricevute dal vicino destro */
 
         if (use_halo) {
-            MPI_Type_vector(my_h, R, my_w, MPI_PIXEL, &strip_type);
+            /* Datatype che descrive una striscia di 'halo' colonne in una matrice row-major */
+            MPI_Datatype strip_type;
+            MPI_Type_vector(my_h, halo, my_w, MPI_PIXEL, &strip_type);
             MPI_Type_commit(&strip_type);
 
-            int has_left  = (rank > 0);
-            int has_right = (rank < nprocs - 1);
-
-            if (has_left)  left_buf  = (Pixel*)malloc((size_t)my_h * (size_t)R * sizeof(Pixel));
-            if (has_right) right_buf = (Pixel*)malloc((size_t)my_h * (size_t)R * sizeof(Pixel));
+            if (has_left)  left_buf  = (Pixel*)malloc((size_t)my_h * (size_t)halo * sizeof(Pixel));
+            if (has_right) right_buf = (Pixel*)malloc((size_t)my_h * (size_t)halo * sizeof(Pixel));
             if ((has_left && !left_buf) || (has_right && !right_buf)) MPI_Abort(MPI_COMM_WORLD, 7);
 
+            /* Request: handle per le operazioni non bloccanti (fino a 4: 2 recv + 2 send) */
             MPI_Request reqs[4];
             int rq = 0;
 
-            if (has_left)  MPI_Irecv(left_buf,  my_h * R, MPI_PIXEL, rank - 1, 20, MPI_COMM_WORLD, &reqs[rq++]);
-            if (has_right) MPI_Irecv(right_buf, my_h * R, MPI_PIXEL, rank + 1, 21, MPI_COMM_WORLD, &reqs[rq++]);
+            /* Avvio ricezioni non bloccanti (Irecv) */
+            if (has_left)
+                MPI_Irecv(left_buf,  my_h * halo, MPI_PIXEL, rank - 1, 20, MPI_COMM_WORLD, &reqs[rq++]);
+            if (has_right)
+                MPI_Irecv(right_buf, my_h * halo, MPI_PIXEL, rank + 1, 21, MPI_COMM_WORLD, &reqs[rq++]);
 
+            /* Avvio invii non bloccanti (Isend) delle prime/ultime 'halo' colonne */
             if (has_left) {
-                Pixel* send_left = local_in; /* prime R colonne */
+                Pixel* send_left = local_in; /* prime halo colonne */
                 MPI_Isend(send_left, 1, strip_type, rank - 1, 21, MPI_COMM_WORLD, &reqs[rq++]);
             }
             if (has_right) {
-                Pixel* send_right = local_in + (my_w - R); /* ultime R colonne */
+                Pixel* send_right = local_in + (my_w - halo); /* ultime halo colonne */
                 MPI_Isend(send_right, 1, strip_type, rank + 1, 20, MPI_COMM_WORLD, &reqs[rq++]);
             }
 
+            /* Aspetto che tutte le comunicazioni halo siano complete */
             MPI_Waitall(rq, reqs, MPI_STATUSES_IGNORE);
 
             MPI_Type_free(&strip_type);
         }
 
-        /* pad locale: (my_h x (my_w + 2R)) */
-        int pad_w = my_w + 2 * R;
+        /* Calcolo locale: padding + passata orizzontale + passata verticale */
+        const int pad_w = my_w + 2 * R;
         Pixel* pad = (Pixel*)malloc((size_t)my_h * (size_t)pad_w * sizeof(Pixel));
         Pixel* tmp = (Pixel*)malloc((size_t)my_h * (size_t)my_w * sizeof(Pixel));
         if (!pad || !tmp) MPI_Abort(MPI_COMM_WORLD, 8);
@@ -444,24 +466,23 @@ int main(int argc, char** argv) {
             Pixel* prow = pad + (size_t)yy * (size_t)pad_w;
             Pixel* src  = local_in + (size_t)yy * (size_t)my_w;
 
+            /* centro: copio i pixel locali */
             memcpy(prow + R, src, (size_t)my_w * sizeof(Pixel));
 
-            /* sinistra */
-            if (use_halo && rank > 0) {
-                Pixel* lb = left_buf + (size_t)yy * (size_t)R;
-                memcpy(prow, lb, (size_t)R * sizeof(Pixel));
-            } else {
-                Pixel p0 = src[0];
-                for (int xx = 0; xx < R; ++xx) prow[xx] = p0;
+            /* bordo sinistro: replica o usa halo ricevuto */
+            Pixel edgeL = src[0];
+            for (int i = 0; i < R; ++i) prow[i] = edgeL;
+            if (has_left && halo > 0 && left_buf) {
+                Pixel* lb = left_buf + (size_t)yy * (size_t)halo;
+                memcpy(prow + (R - halo), lb, (size_t)halo * sizeof(Pixel));
             }
 
-            /* destra */
-            if (use_halo && rank < nprocs - 1) {
-                Pixel* rb = right_buf + (size_t)yy * (size_t)R;
-                memcpy(prow + R + my_w, rb, (size_t)R * sizeof(Pixel));
-            } else {
-                Pixel plast = src[my_w - 1];
-                for (int xx = 0; xx < R; ++xx) prow[R + my_w + xx] = plast;
+            /* bordo destro: replica o usa halo ricevuto */
+            Pixel edgeR = src[my_w - 1];
+            for (int i = 0; i < R; ++i) prow[R + my_w + i] = edgeR;
+            if (has_right && halo > 0 && right_buf) {
+                Pixel* rb = right_buf + (size_t)yy * (size_t)halo;
+                memcpy(prow + (R + my_w), rb, (size_t)halo * sizeof(Pixel));
             }
         }
 
@@ -488,7 +509,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        /* verticale: tmp -> local_out (clamp in Y) */
+        /* verticale: tmp -> local_out (solo clamp in Y perché la decomposizione è in X) */
         for (int xx = 0; xx < my_w; ++xx) {
             for (int yy = 0; yy < my_h; ++yy) {
                 float ar = 0.f, ag = 0.f, ab = 0.f;
@@ -514,22 +535,26 @@ int main(int argc, char** argv) {
         free(tmp);
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);         /* sincronizzazione: fine compute */
     double tC1 = MPI_Wtime();
+
     double my_comp = tC1 - tC0;
 
+    /* MPI_Reduce: rank 0 prende il massimo dei tempi (tempo reale della fase parallela) */
     double comp_max = 0.0;
     MPI_Reduce(&my_comp, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    /* gather dei blocchi sfocati su rank 0 */
+    /* Gather manuale: ogni rank invia al rank 0 il blocco sfocato */
     Pixel* out_full = NULL;
 
     if (rank == 0) {
         out_full = (Pixel*)malloc((size_t)W * (size_t)H * sizeof(Pixel));
         if (!out_full) MPI_Abort(MPI_COMM_WORLD, 9);
 
+        /* inizializzo l’output copiando l’immagine originale (fuori ROI resta uguale) */
         memcpy(out_full, img, (size_t)W * (size_t)H * sizeof(Pixel));
 
+        /* rank 0 copia il proprio blocco già calcolato */
         if (my_w > 0) {
             for (int yy = 0; yy < my_h; ++yy) {
                 memcpy(out_full + (size_t)(y0 + yy) * (size_t)W + (size_t)(x0 + my_offx),
@@ -538,6 +563,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        /* ricevo i blocchi dagli altri rank e li inserisco nella posizione corretta */
         for (int r = 1; r < nprocs; ++r) {
             int lw = base_w + (r < rem_w ? 1 : 0);
             if (lw <= 0) continue;
@@ -562,14 +588,16 @@ int main(int argc, char** argv) {
             free(tmpblk);
         }
     } else {
+        /* rank != 0 invia il proprio blocco al master */
         if (my_w > 0) {
             MPI_Send(local_out, my_h * my_w, MPI_PIXEL, 0, 30, MPI_COMM_WORLD);
         }
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD); /* tutti hanno finito gather */
 
     if (rank == 0) {
+        /* Solo rank 0 salva e stampa i tempi */
         double tW0 = MPI_Wtime();
         ppm_write(outpath, out_full, W, H);
         double tW1 = MPI_Wtime();
@@ -590,8 +618,7 @@ int main(int argc, char** argv) {
     if (local_in)  free(local_in);
     if (local_out) free(local_out);
 
-    MPI_Type_free(&MPI_PIXEL);
-    MPI_Finalize();
+    MPI_Type_free(&MPI_PIXEL); /* libero il datatype MPI creato */
+    MPI_Finalize();            /* chiusura MPI */
     return 0;
 }
-

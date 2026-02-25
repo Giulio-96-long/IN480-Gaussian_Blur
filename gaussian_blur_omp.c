@@ -17,10 +17,11 @@
  *   - SDL2 (per --select)
  *
  * Installazione dipendenze (Ubuntu/Debian):
+ *   sudo apt update
  *   sudo apt install build-essential libomp-dev libsdl2-dev
  *
  * Compilazione:
- *   gcc -std=c99 -Wall -Wextra -fopenmp gaussian_blur_omp.c roi_select.c stb_impl.c -o gaussian_blur_omp $(sdl2-config --cflags --libs) -lm
+ *   gcc -std=c99 -Wall -Wextra -fopenmp -DHAVE_SDL2 gaussian_blur_omp.c roi_select.c stb_impl.c -o gaussian_blur_omp $(sdl2-config --cflags --libs) -lm
  *
  * Esecuzione:
  *   # ROI da riga di comando
@@ -29,7 +30,7 @@
  *   # ROI selezionata con il mouse (apre finestra)
  *   OMP_NUM_THREADS=8 ./gaussian_blur_omp --select input.ppm output.ppm
  *
- * Output tempi:
+ * Output tempi (stampa su stdout):
  *   Read:    tempo lettura immagine
  *   Compute: tempo calcolo blur sulla ROI
  *   Write:   tempo scrittura immagine
@@ -45,7 +46,16 @@
 #include <unistd.h>
 #include <limits.h>
 
-#include "roi_select.h"
+#ifdef HAVE_SDL2
+  #include "roi_select.h"
+#else
+  /* fallback: compilazione senza SDL2 -> --select disabilitato */
+  static int roi_select_interactive(const char* path, int* x, int* y, int* w, int* h) {
+      (void)path; (void)x; (void)y; (void)w; (void)h;
+      fprintf(stderr, "Errore: programma compilato senza SDL2, usa --region.\n");
+      return 0;
+  }
+#endif
 
 #define GAUSS_RADIUS 60
 
