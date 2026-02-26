@@ -24,6 +24,22 @@
  *
  * Compilazione:
  *   mpicc -std=c99 -Wall -Wextra -DHAVE_SDL2 gaussian_blur_mpi.c roi_select.c stb_impl.c -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
+  * NOTE SUI PERCORSI INPUT/OUTPUT
+ *
+ * Il programma accetta sia percorsi relativi sia percorsi assoluti.
+ *
+ * - Percorso relativo:
+ *     Se viene specificato solo il nome del file (es. "input.ppm"),
+ *     il file deve trovarsi nella directory corrente (da cui viene
+ *     eseguito il programma).
+ *
+ * - Percorso assoluto:
+ *     È possibile specificare il percorso completo del file
+ *     (es. "/home/utente/immagini/input.ppm").
+ *     In questo caso l'immagine può trovarsi in qualsiasi directory
+ *     del filesystem.
+ *
+ * In caso di percorso errato o file inesistente, il programma termina con errore di apertura file.
  *
  * Esecuzione:
  *   # ROI da riga di comando
