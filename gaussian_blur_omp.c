@@ -22,22 +22,6 @@
  *
  * Compilazione:
  *   gcc -std=c99 -Wall -Wextra -fopenmp -DHAVE_SDL2 gaussian_blur_omp.c roi_select.c stb_impl.c -o gaussian_blur_omp $(sdl2-config --cflags --libs) -lm
-  * NOTE SUI PERCORSI INPUT/OUTPUT
- *
- * Il programma accetta sia percorsi relativi sia percorsi assoluti.
- *
- * - Percorso relativo:
- *     Se viene specificato solo il nome del file (es. "input.ppm"),
- *     il file deve trovarsi nella directory corrente (da cui viene
- *     eseguito il programma).
- *
- * - Percorso assoluto:
- *     È possibile specificare il percorso completo del file
- *     (es. "/home/utente/immagini/input.ppm").
- *     In questo caso l'immagine può trovarsi in qualsiasi directory
- *     del filesystem.
- *
- * In caso di percorso errato o file inesistente, il programma termina con errore di apertura file.
  *
  * Esecuzione:
  *   # ROI da riga di comando
@@ -287,25 +271,45 @@ int main(int argc, char **argv) {
     double tRead0 = omp_get_wtime();
     Pixel *img = image_read_any(inputPath, &imgW, &imgH);
     double tRead1 = omp_get_wtime();
-
+    
+    // Se la lettura dell’immagine è fallita (puntatore NULL), esco subito
     if (!img) { fprintf(stderr, "Errore lettura immagine\n"); return 1; }
 
+    // validazione ROI 
+    // Se la ROI parte con coordinate negative, la sposto a 0 (non posso andare fuori immagine)
     if (roiX < 0) roiX = 0;
     if (roiY < 0) roiY = 0;
+    
+    // Se il punto di inizio ROI è già fuori dall’immagine, è un errore
     if (roiX >= imgW || roiY >= imgH) {
         fprintf(stderr, "ROI fuori immagine\n");
         free(img);
         return 1;
     }
+    
+    // Se ROI supera il bordo destro, riduco la larghezza per farla rientrare
     if (roiX + roiW > imgW) roiW = imgW - roiX;
-    if (roiY + roiH > imgH) roiH = imgH - roiY;
-    if (roiW <= 0 || roiH <= 0) { fprintf(stderr, "ROI vuota\n"); free(img); return 1; }
 
-    const int R = GAUSS_RADIUS;
-    const int K = 2 * R + 1;
+    // Se ROI supera il bordo inferiore, riduco l’altezza per farla rientrare
+    if (roiY + roiH > imgH) roiH = imgH - roiY;
+
+    // Se dopo i clamp la ROI diventa nulla o negativa, non ha senso filtrare → errore
+    if (roiW <= 0 || roiH <= 0) { 
+        fprintf(stderr, "ROI vuota\n"); 
+        free(img); 
+        return 1; 
+    }
+
+    // Parametri del kernel gaussiano separabile 
+
+    const int R = GAUSS_RADIUS; // raggio del filtro
+    const int K = 2 * R + 1;  // dimensione kernel 1D
+    
+    // Dimensioni della ROI “padded” (aggiungiamo ghost cells ai bordi)    
     const int paddedW = roiW + 2 * R;
     const int paddedH = roiH + 2 * R;
 
+    // Allocazioni
     Pixel *out = (Pixel*)malloc((size_t)imgW * (size_t)imgH * sizeof(Pixel));
     float *kernel = gauss_kernel_1d_make(R);
     Pixel *paddedROI = (Pixel*)malloc((size_t)paddedW * (size_t)paddedH * sizeof(Pixel));
@@ -316,7 +320,9 @@ int main(int argc, char **argv) {
         free(img); free(out); free(kernel); free(paddedROI); free(tmpT);
         return 1;
     }
-
+    
+    // Copio l’immagine originale in out: così fuori dalla ROI resta identica,
+    // e poi sovrascrivo solo i pixel della ROI con la versione blur
     memcpy(out, img, (size_t)imgW * (size_t)imgH * sizeof(Pixel));
 
     double tComp0 = omp_get_wtime();
@@ -325,30 +331,43 @@ int main(int argc, char **argv) {
         shared(img, out, kernel, paddedROI, tmpT, imgW, imgH, roiX, roiY, roiW, roiH) \
         firstprivate(R, K, paddedW, paddedH)
     {
+    
+      // Costruzione della ROI "padded" (ghost cells):
+      // Copiamo dentro paddedROI una finestra più grande della ROI, estesa di R pixel per lato.
+      // Ai bordi usiamo clamp per replicare i pixel (non andiamo mai fuori immagine).
         #pragma omp for schedule(static)
         for (int py = 0; py < paddedH; py++) {
             int srcY = clamp_int(roiY + py - R, 0, imgH - 1);
             for (int px = 0; px < paddedW; px++) {
                 int srcX = clamp_int(roiX + px - R, 0, imgW - 1);
+                // Scrivo il pixel nel buffer padded (accesso contiguo per righe)
                 paddedROI[(size_t)py * (size_t)paddedW + (size_t)px] =
                     img[(size_t)srcY * (size_t)imgW + (size_t)srcX];
             }
         }
-
+        
+        
+    // Prima passata: convoluzione ORIZZONTALE sulla ROI.
+    // Per ogni pixel della ROI, applichiamo il kernel 1D su una finestra di K pixel in orizzontale.
+    // Il risultato lo salviamo in tmpT *trasposto* (indice [x][y]) per migliorare cache nella seconda passata.
+        
         #pragma omp for schedule(static)
         for (int y = 0; y < roiH; y++) {
+          // Puntatore alla riga della paddedROI corrispondente alla riga y della ROI (shift di R)
             const Pixel *padRow = paddedROI + (size_t)(y + R) * (size_t)paddedW;
+          
             for (int x = 0; x < roiW; x++) {
                 float accR = 0.f, accG = 0.f, accB = 0.f;
                 const Pixel *win = padRow + x;
-
+               // Somma pesata dei K campioni (kernel gaussiano 1D)
                 for (int t = 0; t < K; t++) {
                     float w = kernel[t];
                     accR += w * win[t].r;
                     accG += w * win[t].g;
                     accB += w * win[t].b;
                 }
-
+                 // Salvo in tmpT in forma trasposta: [x * roiH + y]
+                  // (così nella passata verticale leggerò memoria contigua)
                 tmpT[(size_t)x * (size_t)roiH + (size_t)y] = (Pixel){
                     (unsigned char)(accR + 0.5f),
                     (unsigned char)(accG + 0.5f),
@@ -356,12 +375,16 @@ int main(int argc, char **argv) {
                 };
             }
         }
-
+      // Seconda passata: convoluzione VERTICALE.
+      // Ora lavoriamo su tmpT (che è trasposto): ogni "colonna" è contigua in memoria.
+      // Applichiamo il kernel su y e scriviamo il risultato finale direttamente in out (solo dentro la ROI).
         #pragma omp for schedule(static)
         for (int x = 0; x < roiW; x++) {
+            // col punta all’inizio della “colonna” x (contigua perché tmpT è trasposto)
             const Pixel *col = tmpT + (size_t)x * (size_t)roiH;
             for (int y = 0; y < roiH; y++) {
                 float accR = 0.f, accG = 0.f, accB = 0.f;
+                // Finestra verticale: dt va da -R a +R (K campioni)
                 for (int dt = -R; dt <= R; dt++) {
                     int yy = clamp_int(y + dt, 0, roiH - 1);
                     Pixel p = col[yy];
@@ -370,6 +393,7 @@ int main(int argc, char **argv) {
                     accG += w * p.g;
                     accB += w * p.b;
                 }
+                // Scrivo il pixel filtrato nella posizione corrispondente dell’immagine output
                 out[(size_t)(roiY + y) * (size_t)imgW + (size_t)(roiX + x)] = (Pixel){
                     (unsigned char)(accR + 0.5f),
                     (unsigned char)(accG + 0.5f),

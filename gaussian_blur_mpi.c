@@ -24,22 +24,6 @@
  *
  * Compilazione:
  *   mpicc -std=c99 -Wall -Wextra -DHAVE_SDL2 gaussian_blur_mpi.c roi_select.c stb_impl.c -o gaussian_blur_mpi $(sdl2-config --cflags --libs) -lm
-  * NOTE SUI PERCORSI INPUT/OUTPUT
- *
- * Il programma accetta sia percorsi relativi sia percorsi assoluti.
- *
- * - Percorso relativo:
- *     Se viene specificato solo il nome del file (es. "input.ppm"),
- *     il file deve trovarsi nella directory corrente (da cui viene
- *     eseguito il programma).
- *
- * - Percorso assoluto:
- *     È possibile specificare il percorso completo del file
- *     (es. "/home/utente/immagini/input.ppm").
- *     In questo caso l'immagine può trovarsi in qualsiasi directory
- *     del filesystem.
- *
- * In caso di percorso errato o file inesistente, il programma termina con errore di apertura file.
  *
  * Esecuzione:
  *   # ROI da riga di comando
@@ -369,24 +353,50 @@ int main(int argc, char** argv) {
     Pixel* local_in  = 0;  /* sotto-ROI locale in input */
     Pixel* local_out = 0;  /* sotto-ROI locale in output */
 
-    /* Scatter manuale: rank 0 invia ad ogni rank il suo blocco di ROI */
+    // Scatter manuale della ROI: il rank 0 divide la ROI in blocchi di colonne
+    // e manda a ciascun processo la sua "fetta" (sub-ROI) con MPI_Send.
+    // NOTA: lo facciamo manualmente perché i blocchi possono avere larghezze diverse (rem_w)
+    // e perché la ROI nella memoria dell'immagine è contigua per righe,
     if (rank == 0) {
+        // Per ogni processo r, calcolo:
+        // - lw   = larghezza locale (numero di colonne assegnate a r)
+        // - offx = offset orizzontale (quante colonne devo saltare dall'inizio della ROI)
         for (int r = 0; r < nprocs; ++r) {
+             // base_w = roiW / nprocs (divisione intera)
+            // rem_w  = roiW % nprocs (colonne "avanzo" da distribuire)
+            //
+            // Strategia:
+            //   - i primi rem_w rank prendono (base_w + 1) colonne
+            //   - gli altri prendono base_w colonne
             int lw = base_w + (r < rem_w ? 1 : 0);
             if (lw <= 0) continue;
-
+            // Calcolo dell'offset offx (inizio blocco r nella ROI):
+            //
+            // Caso 1) r < rem_w:
+            //   ognuno dei rank precedenti ha preso (base_w + 1) colonne,
+            //   quindi offx = r * (base_w + 1)
+            //
+            // Caso 2) r >= rem_w:
+            //   i primi rem_w rank hanno preso (base_w + 1) colonne,
+            //   i restanti (r - rem_w) hanno preso base_w colonne
+            //   quindi offx = rem_w*(base_w + 1) + (r - rem_w)*base_w
             int offx;
             if (r < rem_w) {
                 offx = r * (base_w + 1);
             } else {
                 offx = rem_w * (base_w + 1) + (r - rem_w) * base_w;
             }
-
+             // r == 0: il rank 0 non deve "ricevere", si copia direttamente la sua parte.
             if (r == 0) {
-                /* rank 0: copia direttamente la sua parte in local_in */
+            
+                // local_in contiene la porzione di ROI assegnata al rank 0
+                // dimensione: my_h x my_w (dove my_w è la lw del rank 0)
                 local_in = (Pixel*)malloc((size_t)my_h * (size_t)my_w * sizeof(Pixel));
                 if (!local_in) MPI_Abort(MPI_COMM_WORLD, 5);
-
+                
+                // Copia riga per riga:
+                // sorgente: img[(y0+yy)*W + (x0 + offx)]
+                // destinazione: local_in[yy*my_w]
                 for (int yy = 0; yy < my_h; ++yy) {
                     memcpy(local_in + (size_t)yy * (size_t)my_w,
                            img + (size_t)(y0 + yy) * (size_t)W + (size_t)(x0 + offx),
@@ -446,7 +456,7 @@ int main(int argc, char** argv) {
             if (has_right) right_buf = (Pixel*)malloc((size_t)my_h * (size_t)halo * sizeof(Pixel));
             if ((has_left && !left_buf) || (has_right && !right_buf)) MPI_Abort(MPI_COMM_WORLD, 7);
 
-            /* Request: handle per le operazioni non bloccanti (fino a 4: 2 recv + 2 send) */
+            /* Request: handle per le operazioni non bloccanti */
             MPI_Request reqs[4];
             int rq = 0;
 
@@ -505,18 +515,29 @@ int main(int argc, char** argv) {
         if (left_buf)  free(left_buf);
         if (right_buf) free(right_buf);
 
-        /* orizzontale: pad -> tmp */
+        // Passata ORIZZONTALE del Gaussian blur (kernel 1D) sulla ROI locale.
+        // Per ogni pixel (yy,xx) calcoliamo la somma pesata dei pixel vicini in orizzontale
+        // usando il kernel k di dimensione (2*R + 1).
         for (int yy = 0; yy < my_h; ++yy) {
+        
+            // Puntatore all'inizio della riga yy nel buffer padded (pad)
+            // pad_w è la larghezza della riga nel buffer padded
             const Pixel* row = pad + (size_t)yy * (size_t)pad_w;
             for (int xx = 0; xx < my_w; ++xx) {
+                // Accumulatori float per i 3 canali (R,G,B)
                 float ar = 0.f, ag = 0.f, ab = 0.f;
+                // Inizio finestra di convoluzione: parte dal pixel xx della riga padded
+                // Grazie al padding (ghost cells).
                 const Pixel* win = row + xx;
+                // Convoluzione 1D: somma pesata su K = (2*R + 1) campioni
                 for (int t = 0; t < 2 * R + 1; ++t) {
                     float wt = k[t];
                     ar += wt * win[t].r;
                     ag += wt * win[t].g;
                     ab += wt * win[t].b;
                 }
+                // Scrivo il risultato nel buffer temporaneo tmp (stessa dimensione della ROI locale)
+                // +0.5f per arrotondare correttamente prima del cast a unsigned char
                 tmp[(size_t)yy * (size_t)my_w + (size_t)xx] = (Pixel){
                     (unsigned char)(ar + 0.5f),
                     (unsigned char)(ag + 0.5f),
@@ -556,7 +577,7 @@ int main(int argc, char** argv) {
 
     double my_comp = tC1 - tC0;
 
-    /* MPI_Reduce: rank 0 prende il massimo dei tempi */
+    /* MPI_Reduce: rank 0 prende il massimo dei tempi (tempo reale della fase parallela) */
     double comp_max = 0.0;
     MPI_Reduce(&my_comp, &comp_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
